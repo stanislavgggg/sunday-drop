@@ -13,7 +13,7 @@ import logging
 import os
 import sys
 
-from telegram import Update
+from telegram import Update, ReplyKeyboardRemove
 from telegram.error import Conflict, NetworkError
 from telegram.ext import (
     Application, CommandHandler, ContextTypes, MessageHandler, filters,
@@ -119,6 +119,23 @@ def _legal_footer(lang: str) -> str:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user    = update.effective_user
     chat_id = update.effective_chat.id
+
+    # ── Снести залипшую reply-клавиатуру от старого кода ─────────────────────
+    # Старый деплой когда-то прислал ReplyKeyboardMarkup с web_app-кнопкой
+    # («🍒 Получать на почту»). Reply-клавиатура хранится в КЛИЕНТЕ per-chat и
+    # переживает редеплой: новый код её не шлёт, поэтому и не заменяет, и не
+    # убирает. Inline-кнопка хука её НЕ трогает — это отдельный слой UI. Снять
+    # можно только ReplyKeyboardRemove: шлём временное сообщение-носитель и
+    # сразу удаляем его — снятие клавиатуры сохраняется и после удаления.
+    # Глобального сброса для reply-клавиатур (как у menu button) у Telegram нет:
+    # у каждого юзера она исчезнет при первом /start после этого деплоя.
+    try:
+        _tmp = await context.bot.send_message(
+            chat_id, "\u2063", reply_markup=ReplyKeyboardRemove()
+        )
+        await context.bot.delete_message(chat_id, _tmp.message_id)
+    except Exception as e:
+        logger.debug(f"reply-keyboard cleanup skipped: {e}")
 
     detected = _detect_lang(user.language_code)
     u_check  = get_user(user.id, detected)
