@@ -260,12 +260,28 @@ async def cmd_funnel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── Post-init ─────────────────────────────────────────────────────────────────
 
 async def post_init(application: Application):
-    from telegram import BotCommand
+    from telegram import BotCommand, MenuButtonCommands
     await application.bot.set_my_commands([
         BotCommand("start",  "Start"),
         BotCommand("policy", "Privacy policy"),
         BotCommand("lang",   "Language: en / ru / es"),
     ])
+
+    # ── Menu Button: жёстко выправляем на КАЖДОМ старте ───────────────────────
+    # Воронка собирает email ВНУТРИ бота (inline-кнопка /start → ConversationHandler),
+    # а НЕ через мини-апп. Но кнопка-меню (Menu Button) хранится на стороне Telegram
+    # глобально и переживает любой редеплой кода: старый деплой когда-то выставил
+    # MenuButtonWebApp («🍒 Получать на почту»), и она осталась висеть, хотя в коде
+    # её уже никто не ставит. Удалять нечего — её нужно АКТИВНО перезаписать.
+    # MenuButtonCommands надёжно затирает застрявший WebApp-баттон (надёжнее, чем
+    # MenuButtonDefault, который в части клиентов не сбрасывает WebApp). chat_id не
+    # передаём → меняем глобальный дефолт для всех приватных чатов.
+    try:
+        await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+        logger.info("Menu Button reset → MenuButtonCommands (no web_app)")
+    except Exception as e:
+        logger.warning(f"set_chat_menu_button failed: {e}")
+
     logger.info(f"{BRAND.display_name} bot ready (in-chat email → channel invite)")
 
 
