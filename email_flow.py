@@ -158,15 +158,33 @@ def build_email_conversation(detect_lang):
         append_history(uid, "user", email)
 
         src = get_user(uid).get("src") or "direct"
-        status, data = await capture.subscribe(dict(
-            email=email,
-            consent=True,                      # тап + текст согласия = явное согласие (логируется)
-            lang=lang,
-            verticals=emailcfg.BOT_VERTICALS,  # soft → Mailchimp
-            source=f"bot_chat:{src}",          # атрибуция креатива для CAC/качества по источнику
-            wrapper=emailcfg.WRAPPER,
-            tg_id=uid,
-        ), ip="")
+
+        # Последний рубеж: что бы ни случилось внутри (БД легла, неожиданная
+        # ошибка ESP, таймаут сети) — юзер НЕ должен зависнуть без ответа.
+        # emaildb.py сам падает на JSON-фоллбэк при сбое Postgres, но это
+        # дополнительная страховка против любого непредвиденного исключения.
+        try:
+            status, data = await capture.subscribe(dict(
+                email=email,
+                consent=True,                      # тап + текст согласия = явное согласие (логируется)
+                lang=lang,
+                verticals=emailcfg.BOT_VERTICALS,  # soft → Mailchimp
+                source=f"bot_chat:{src}",          # атрибуция креатива для CAC/качества по источнику
+                wrapper=emailcfg.WRAPPER,
+                tg_id=uid,
+            ), ip="")
+        except Exception as e:
+            # [LEAD_EMERGENCY] — грепаемый тег: лид виден в Railway-логах даже
+            # если ВСЁ хранилище недоступно. Юзеру всё равно отдаём канал —
+            # конверсия важнее идеальной записи, а резинк добор сделает позже.
+            logger.error(f"[LEAD_EMERGENCY] capture.subscribe crashed user={uid} email={email} "
+                        f"src={src}: {e}", exc_info=True)
+            update_user(uid, state=State.DEPOSITED, email=email, awaiting_email=False)
+            analytics.mark_join(uid)
+            analytics.track("capture_exception", uid)
+            append_history(uid, "assistant", "[channel invite delivered — degraded, see LEAD_EMERGENCY log]")
+            await deliver_channel(ctx.bot, chat_id, lang)
+            return ConversationHandler.END
 
         err = data.get("error")
         if err == "invalid_email":

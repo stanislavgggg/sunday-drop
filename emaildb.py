@@ -3,7 +3,18 @@ emaildb.py — contact store for email capture.
 
 System of record for collected emails. Postgres (via DATABASE_URL) in prod,
 JSON-file fallback for local dev. Railway's filesystem is ephemeral, so emails
-MUST live in Postgres in production — never rely on the JSON fallback there.
+MUST live in Postgres in production — never rely on the JSON fallback there
+as the PRIMARY store.
+
+ВАЖНО (надёжность): любой сбой Postgres (временная недоступность, дроп
+соединения, рестарт инстанса) НЕ должен ронять вызывающий код — иначе юзер,
+который в этот момент прислал email в боте, зависает без ответа (хендлер
+падает с необработанным исключением). Поэтому каждая публичная функция здесь
+оборачивает PG-ветку в try/except и при сбое прозрачно проваливается в JSON-
+фоллбэк (тот же, что используется в DEV без DATABASE_URL) — лид не теряется,
+просто временно лежит в локальном JSON, пока PG не вернётся. `_pg_try()`
+делает один re-connect не чаще, чем раз в `_PG_RETRY_COOLDOWN` секунд, чтобы
+не долбить мёртвую базу на каждый запрос.
 
 Two tables:
   email_contacts   — one row per (brand, email): status, interests, consent, tokens
@@ -22,6 +33,7 @@ logger = logging.getLogger(__name__)
 DATABASE_URL  = os.environ.get("DATABASE_URL", "").strip()
 EMAIL_DB_PATH = os.environ.get("EMAIL_DB_PATH", "email_contacts.json")
 _USE_PG = bool(DATABASE_URL)
+_PG_RETRY_COOLDOWN = 15.0  # сек между попытками реконнекта после сбоя
 
 # ── token helpers ───────────────────────────────────────────────────────────
 def _token() -> str:
@@ -36,6 +48,7 @@ def _norm_email(email: str) -> str:
 
 # ── Postgres backend ────────────────────────────────────────────────────────
 _pg_ready = False
+_pg_unavailable_until = 0.0
 
 def _pg():
     """Return a fresh autocommit psycopg connection (lazy import)."""
@@ -92,6 +105,30 @@ def _pg_init():
         c.execute("CREATE INDEX IF NOT EXISTS ix_contacts_unsub  ON email_contacts (unsub_token);")
     _pg_ready = True
 
+
+def _pg_try() -> bool:
+    """Best-effort Postgres init. Returns True если PG доступен прямо сейчас.
+
+    НИКОГДА не бросает исключение — вызывающий код при False должен упасть на
+    JSON-фоллбэк, а не на ошибку. Бэк-офф в `_PG_RETRY_COOLDOWN` сек защищает
+    от долбления мёртвой базы на каждый /start или email в воронке.
+    """
+    global _pg_unavailable_until
+    if _pg_ready:
+        return True
+    now = _now()
+    if now < _pg_unavailable_until:
+        return False
+    try:
+        _pg_init()
+        return True
+    except Exception as e:
+        logger.error(f"[emaildb] Postgres unavailable, falling back to JSON: {e}")
+        _pg_unavailable_until = now + _PG_RETRY_COOLDOWN
+        _json_load_once()
+        return False
+
+
 _COLS = ["id","brand","email","email_lc","status","verticals","source","wrapper","lang",
          "country","tg_id","consent_text","consent_ver","consent_ts","consent_ip",
          "confirm_token","unsub_token","confirmed_at","unsub_at","created_at","updated_at",
@@ -103,8 +140,9 @@ def _row_to_dict(row) -> dict:
     return d
 
 
-# ── JSON backend (dev only) ─────────────────────────────────────────────────
+# ── JSON backend (dev fallback / PG-outage buffer) ──────────────────────────
 _json_db = {"contacts": {}, "log": []}
+_json_loaded = False
 
 def _json_load():
     global _json_db
@@ -114,6 +152,14 @@ def _json_load():
                 _json_db = json.load(f)
         except Exception as e:
             logger.error(f"email db load error: {e}")
+
+def _json_load_once():
+    """Lazy one-time load — used when PG fails mid-prod, чтобы подцепить уже
+    накопленный с прошлых сбоев JSON-буфер, а не начинать с пустого словаря."""
+    global _json_loaded
+    if not _json_loaded:
+        _json_loaded = True
+        _json_load()
 
 def _json_save():
     try:
@@ -128,12 +174,9 @@ def _json_key(brand, email_lc):
     return f"{brand}:{email_lc}"
 
 if not _USE_PG:
-    _json_load()
+    _json_load_once()
 else:
-    try:
-        _pg_init()
-    except Exception as e:  # don't crash the whole API on a bad DB url; log loudly
-        logger.error(f"Postgres init failed, email capture degraded: {e}")
+    _pg_try()   # тёплый старт; при сбое сразу логируем и греем JSON-фоллбэк
 
 
 # ── public API ──────────────────────────────────────────────────────────────
@@ -148,42 +191,45 @@ def upsert_pending(email, brand, *, verticals, source, wrapper, lang, country,
     email_lc = _norm_email(email)
     verticals_s = ",".join(verticals or [])
     now = _now()
-    if _USE_PG:
-        _pg_init()
-        with _pg() as c:
-            cur = c.execute("SELECT * FROM email_contacts WHERE brand=%s AND email_lc=%s",
-                            (brand, email_lc))
-            existing = cur.fetchone()
-            if existing:
-                rec = _row_to_dict(existing)
-                if rec["status"] == "confirmed":
-                    return rec, False
-                ctoken = _token()
-                c.execute("""UPDATE email_contacts SET status='pending', verticals=%s,
-                             source=%s, wrapper=%s, lang=%s, country=%s, tg_id=%s,
-                             consent_text=%s, consent_ver=%s, consent_ts=%s, consent_ip=%s,
-                             confirm_token=%s, updated_at=%s
-                             WHERE brand=%s AND email_lc=%s""",
-                          (verticals_s, source, wrapper, lang, country, tg_id,
-                           consent_text, consent_ver, now, ip, ctoken, now, brand, email_lc))
+    if _USE_PG and _pg_try():
+        try:
+            with _pg() as c:
                 cur = c.execute("SELECT * FROM email_contacts WHERE brand=%s AND email_lc=%s",
                                 (brand, email_lc))
-                _log(brand, email_lc, "resubscribe_pending", ip, {"verticals": verticals})
-                return _row_to_dict(cur.fetchone()), False
-            ctoken, utoken = _token(), _token()
-            c.execute("""INSERT INTO email_contacts
-                (brand,email,email_lc,status,verticals,source,wrapper,lang,country,tg_id,
-                 consent_text,consent_ver,consent_ts,consent_ip,confirm_token,unsub_token,
-                 created_at,updated_at)
-                VALUES (%s,%s,%s,'pending',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-                (brand, email, email_lc, verticals_s, source, wrapper, lang, country, tg_id,
-                 consent_text, consent_ver, now, ip, ctoken, utoken, now, now))
-            cur = c.execute("SELECT * FROM email_contacts WHERE brand=%s AND email_lc=%s",
-                            (brand, email_lc))
-            _log(brand, email_lc, "subscribe_pending", ip, {"verticals": verticals, "source": source})
-            return _row_to_dict(cur.fetchone()), True
+                existing = cur.fetchone()
+                if existing:
+                    rec = _row_to_dict(existing)
+                    if rec["status"] == "confirmed":
+                        return rec, False
+                    ctoken = _token()
+                    c.execute("""UPDATE email_contacts SET status='pending', verticals=%s,
+                                 source=%s, wrapper=%s, lang=%s, country=%s, tg_id=%s,
+                                 consent_text=%s, consent_ver=%s, consent_ts=%s, consent_ip=%s,
+                                 confirm_token=%s, updated_at=%s
+                                 WHERE brand=%s AND email_lc=%s""",
+                              (verticals_s, source, wrapper, lang, country, tg_id,
+                               consent_text, consent_ver, now, ip, ctoken, now, brand, email_lc))
+                    cur = c.execute("SELECT * FROM email_contacts WHERE brand=%s AND email_lc=%s",
+                                    (brand, email_lc))
+                    _log(brand, email_lc, "resubscribe_pending", ip, {"verticals": verticals})
+                    return _row_to_dict(cur.fetchone()), False
+                ctoken, utoken = _token(), _token()
+                c.execute("""INSERT INTO email_contacts
+                    (brand,email,email_lc,status,verticals,source,wrapper,lang,country,tg_id,
+                     consent_text,consent_ver,consent_ts,consent_ip,confirm_token,unsub_token,
+                     created_at,updated_at)
+                    VALUES (%s,%s,%s,'pending',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (brand, email, email_lc, verticals_s, source, wrapper, lang, country, tg_id,
+                     consent_text, consent_ver, now, ip, ctoken, utoken, now, now))
+                cur = c.execute("SELECT * FROM email_contacts WHERE brand=%s AND email_lc=%s",
+                                (brand, email_lc))
+                _log(brand, email_lc, "subscribe_pending", ip, {"verticals": verticals, "source": source})
+                return _row_to_dict(cur.fetchone()), True
+        except Exception as e:
+            logger.error(f"[emaildb] upsert_pending PG error, falling back to JSON: {e}")
+            _json_load_once()
 
-    # JSON fallback
+    # JSON fallback (dev, или PG временно недоступен)
     k = _json_key(brand, email_lc)
     rec = _json_db["contacts"].get(k)
     if rec and rec["status"] == "confirmed":
@@ -215,12 +261,15 @@ def _json_pub(rec) -> dict:
 
 def get_by_token(token, kind="confirm"):
     field = "confirm_token" if kind == "confirm" else "unsub_token"
-    if _USE_PG:
-        _pg_init()
-        with _pg() as c:
-            cur = c.execute(f"SELECT * FROM email_contacts WHERE {field}=%s", (token,))
-            row = cur.fetchone()
-            return _row_to_dict(row) if row else None
+    if _USE_PG and _pg_try():
+        try:
+            with _pg() as c:
+                cur = c.execute(f"SELECT * FROM email_contacts WHERE {field}=%s", (token,))
+                row = cur.fetchone()
+                return _row_to_dict(row) if row else None
+        except Exception as e:
+            logger.error(f"[emaildb] get_by_token PG error, falling back to JSON: {e}")
+            _json_load_once()
     for rec in _json_db["contacts"].values():
         if rec.get(field) == token:
             return _json_pub(rec)
@@ -230,16 +279,21 @@ def get_by_token(token, kind="confirm"):
 def mark(email_lc, brand, status, ip=""):
     now = _now()
     ts_field = {"confirmed": "confirmed_at", "unsubscribed": "unsub_at"}.get(status)
-    if _USE_PG:
-        _pg_init()
-        with _pg() as c:
-            if ts_field:
-                c.execute(f"UPDATE email_contacts SET status=%s, {ts_field}=%s, updated_at=%s "
-                          f"WHERE brand=%s AND email_lc=%s", (status, now, now, brand, email_lc))
-            else:
-                c.execute("UPDATE email_contacts SET status=%s, updated_at=%s "
-                          "WHERE brand=%s AND email_lc=%s", (status, now, brand, email_lc))
-    else:
+    handled = False
+    if _USE_PG and _pg_try():
+        try:
+            with _pg() as c:
+                if ts_field:
+                    c.execute(f"UPDATE email_contacts SET status=%s, {ts_field}=%s, updated_at=%s "
+                              f"WHERE brand=%s AND email_lc=%s", (status, now, now, brand, email_lc))
+                else:
+                    c.execute("UPDATE email_contacts SET status=%s, updated_at=%s "
+                              "WHERE brand=%s AND email_lc=%s", (status, now, brand, email_lc))
+            handled = True
+        except Exception as e:
+            logger.error(f"[emaildb] mark PG error, falling back to JSON: {e}")
+            _json_load_once()
+    if not handled:
         rec = _json_db["contacts"].get(_json_key(brand, email_lc))
         if rec:
             rec["status"] = status
@@ -252,11 +306,16 @@ def mark(email_lc, brand, status, ip=""):
 
 def erase(email_lc, brand, ip=""):
     """GDPR right-to-erasure: drop the contact row. Keep a minimal anonymised log."""
-    if _USE_PG:
-        _pg_init()
-        with _pg() as c:
-            c.execute("DELETE FROM email_contacts WHERE brand=%s AND email_lc=%s", (brand, email_lc))
-    else:
+    handled = False
+    if _USE_PG and _pg_try():
+        try:
+            with _pg() as c:
+                c.execute("DELETE FROM email_contacts WHERE brand=%s AND email_lc=%s", (brand, email_lc))
+            handled = True
+        except Exception as e:
+            logger.error(f"[emaildb] erase PG error, falling back to JSON: {e}")
+            _json_load_once()
+    if not handled:
         _json_db["contacts"].pop(_json_key(brand, email_lc), None)
         _json_save()
     _log(brand, "[erased]", "erase", ip, {})
@@ -265,15 +324,20 @@ def erase(email_lc, brand, ip=""):
 def set_esp_status(email_lc, brand, esp_name, ok, error=None):
     """Записать результат пуша контакта в ESP. Источник правды для ре-синка."""
     now = _now()
-    if _USE_PG:
-        _pg_init()
-        with _pg() as c:
-            c.execute("UPDATE email_contacts SET esp_ok=%s, esp_name=%s, "
-                      "esp_synced_at=%s, esp_error=%s, updated_at=%s "
-                      "WHERE brand=%s AND email_lc=%s",
-                      (bool(ok), esp_name, now, (None if ok else (error or "")[:300]),
-                       now, brand, email_lc))
-    else:
+    handled = False
+    if _USE_PG and _pg_try():
+        try:
+            with _pg() as c:
+                c.execute("UPDATE email_contacts SET esp_ok=%s, esp_name=%s, "
+                          "esp_synced_at=%s, esp_error=%s, updated_at=%s "
+                          "WHERE brand=%s AND email_lc=%s",
+                          (bool(ok), esp_name, now, (None if ok else (error or "")[:300]),
+                           now, brand, email_lc))
+            handled = True
+        except Exception as e:
+            logger.error(f"[emaildb] set_esp_status PG error, falling back to JSON: {e}")
+            _json_load_once()
+    if not handled:
         rec = _json_db["contacts"].get(_json_key(brand, email_lc))
         if rec:
             rec["esp_ok"] = bool(ok)
@@ -289,15 +353,18 @@ def pending_esp_sync(brand=None):
 
     Сюда попадают и старые записи (esp_ok = NULL), и те, у кого пуш падал.
     """
-    if _USE_PG:
-        _pg_init()
-        with _pg() as c:
-            q = ("SELECT * FROM email_contacts "
-                 "WHERE status='confirmed' AND (esp_ok IS NULL OR esp_ok=FALSE)")
-            args = ()
-            if brand:
-                q += " AND brand=%s"; args = (brand,)
-            return [_row_to_dict(r) for r in c.execute(q, args).fetchall()]
+    if _USE_PG and _pg_try():
+        try:
+            with _pg() as c:
+                q = ("SELECT * FROM email_contacts "
+                     "WHERE status='confirmed' AND (esp_ok IS NULL OR esp_ok=FALSE)")
+                args = ()
+                if brand:
+                    q += " AND brand=%s"; args = (brand,)
+                return [_row_to_dict(r) for r in c.execute(q, args).fetchall()]
+        except Exception as e:
+            logger.error(f"[emaildb] pending_esp_sync PG error, falling back to JSON: {e}")
+            _json_load_once()
     return [_json_pub(r) for r in _json_db["contacts"].values()
             if r["status"] == "confirmed" and not r.get("esp_ok")
             and (not brand or r["brand"] == brand)]
@@ -305,51 +372,59 @@ def pending_esp_sync(brand=None):
 
 def _log(brand, email_lc, event, ip, meta):
     now = _now()
-    if _USE_PG:
+    if _USE_PG and _pg_try():
         try:
             with _pg() as c:
                 c.execute("INSERT INTO email_consent_log (brand,email_lc,event,ip,meta,ts) "
                           "VALUES (%s,%s,%s,%s,%s,%s)",
                           (brand, email_lc, event, ip, json.dumps(meta, ensure_ascii=False), now))
+            return
         except Exception as e:
-            logger.error(f"consent log error: {e}")
-    else:
-        _json_db["log"].append(dict(brand=brand, email_lc=email_lc, event=event,
-                                     ip=ip, meta=meta, ts=now))
-        _json_save()
+            logger.error(f"[emaildb] consent log PG error, falling back to JSON: {e}")
+            _json_load_once()
+    _json_db["log"].append(dict(brand=brand, email_lc=email_lc, event=event,
+                                 ip=ip, meta=meta, ts=now))
+    _json_save()
 
 
 def counts(brand=None) -> dict:
     """Funnel counters for CRO: pending / confirmed / unsubscribed."""
     out = {"pending": 0, "confirmed": 0, "unsubscribed": 0, "total": 0}
-    if _USE_PG:
-        _pg_init()
-        with _pg() as c:
-            q = "SELECT status, COUNT(*) FROM email_contacts"
-            args = ()
-            if brand:
-                q += " WHERE brand=%s"; args = (brand,)
-            q += " GROUP BY status"
-            for status, n in c.execute(q, args).fetchall():
-                out[status] = n
-    else:
-        for rec in _json_db["contacts"].values():
-            if brand and rec["brand"] != brand:
-                continue
-            out[rec["status"]] = out.get(rec["status"], 0) + 1
+    if _USE_PG and _pg_try():
+        try:
+            with _pg() as c:
+                q = "SELECT status, COUNT(*) FROM email_contacts"
+                args = ()
+                if brand:
+                    q += " WHERE brand=%s"; args = (brand,)
+                q += " GROUP BY status"
+                for status, n in c.execute(q, args).fetchall():
+                    out[status] = n
+            out["total"] = out["pending"] + out["confirmed"] + out["unsubscribed"]
+            return out
+        except Exception as e:
+            logger.error(f"[emaildb] counts PG error, falling back to JSON: {e}")
+            _json_load_once()
+    for rec in _json_db["contacts"].values():
+        if brand and rec["brand"] != brand:
+            continue
+        out[rec["status"]] = out.get(rec["status"], 0) + 1
     out["total"] = out["pending"] + out["confirmed"] + out["unsubscribed"]
     return out
 
 
 def all_confirmed(brand=None):
     """Confirmed contacts (for ESP sync / export)."""
-    if _USE_PG:
-        _pg_init()
-        with _pg() as c:
-            q = "SELECT * FROM email_contacts WHERE status='confirmed'"
-            args = ()
-            if brand:
-                q += " AND brand=%s"; args = (brand,)
-            return [_row_to_dict(r) for r in c.execute(q, args).fetchall()]
+    if _USE_PG and _pg_try():
+        try:
+            with _pg() as c:
+                q = "SELECT * FROM email_contacts WHERE status='confirmed'"
+                args = ()
+                if brand:
+                    q += " AND brand=%s"; args = (brand,)
+                return [_row_to_dict(r) for r in c.execute(q, args).fetchall()]
+        except Exception as e:
+            logger.error(f"[emaildb] all_confirmed PG error, falling back to JSON: {e}")
+            _json_load_once()
     return [_json_pub(r) for r in _json_db["contacts"].values()
             if r["status"] == "confirmed" and (not brand or r["brand"] == brand)]
