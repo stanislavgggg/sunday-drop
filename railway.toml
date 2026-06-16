@@ -1,0 +1,9 @@
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+# api.py в фоне, bot.py на переднем плане.
+# sh -c с явным kill api при завершении bot.
+startCommand = "sh -c 'python api.py & APID=$!; python bot.py; kill $APID 2>/dev/null'"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
